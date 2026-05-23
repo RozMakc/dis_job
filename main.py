@@ -17,6 +17,20 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+async def _run_discord():
+    try:
+        await start_discord()
+    except Exception:
+        logger.exception("Discord bot crashed")
+
+
+async def _run_telegram(tg_bot):
+    try:
+        await dp.start_polling(tg_bot, allowed_updates=dp.resolve_used_update_types())
+    except Exception:
+        logger.exception("Telegram bot crashed")
+
+
 async def main():
     if not config.DISCORD_TOKEN or not config.TELEGRAM_TOKEN:
         logger.error("DISCORD_TOKEN and TELEGRAM_TOKEN must be set in .env")
@@ -38,9 +52,6 @@ async def main():
 
     logger.info("Starting bots...")
 
-    discord_task = asyncio.create_task(start_discord())
-    telegram_task = asyncio.create_task(dp.start_polling(tg_bot, allowed_updates=dp.resolve_used_update_types()))
-
     stop_event = asyncio.Event()
 
     def _shutdown():
@@ -53,14 +64,33 @@ async def main():
         except NotImplementedError:
             pass
 
-    await stop_event.wait()
+    while not stop_event.is_set():
+        discord_task = asyncio.create_task(_run_discord())
+        telegram_task = asyncio.create_task(_run_telegram(tg_bot))
+
+        done, pending = await asyncio.wait(
+            [discord_task, telegram_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in done:
+            exc = task.exception()
+            if exc:
+                name = "Discord" if task is discord_task else "Telegram"
+                logger.error("%s bot failed: %s", name, exc)
+
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        if not stop_event.is_set():
+            logger.info("Restarting crashed bots in 5 seconds...")
+            await asyncio.sleep(5)
 
     logger.info("Shutting down...")
-    discord_task.cancel()
-    telegram_task.cancel()
-
-    await asyncio.gather(discord_task, telegram_task, return_exceptions=True)
-
     await stop_discord()
     await tg_bot.session.close()
     await close_db()
@@ -68,4 +98,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
